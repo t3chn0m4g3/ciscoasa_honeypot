@@ -3,6 +3,7 @@
 import os
 import time
 import socket
+import ssl
 import logging
 import threading
 from io import BytesIO
@@ -290,7 +291,9 @@ if __name__ == '__main__':
             if not cert:
                 import gencert
                 cert = gencert.gencert()
-            httpd.socket = ssl.wrap_socket(httpd.socket, certfile=cert, server_side=True)
+            context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            context.load_cert_chain(certfile=cert)
+            httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
 
         logger.info('Starting server on port {:d}/tcp, use <Ctrl-C> to stop'.format(port))
         hpfl.log('info', 'Starting server on port {:d}/tcp, use <Ctrl-C> to stop'.format(port))
