@@ -5,6 +5,7 @@ import time
 import socket
 import ssl
 import logging
+logging.basicConfig(format='%(message)s')
 import threading
 from io import BytesIO
 from xml.etree import ElementTree
@@ -175,9 +176,9 @@ class WebLogicHandler(SimpleHTTPRequestHandler):
             return self.send_file('wrong_url.html', 404)
 
     def log_message(self, format, *args):
-        self.logger.debug("%s - - [%s] %s" %
-                          (self.client_address[0],
-                           self.log_date_time_string(),
+        self.logger.debug("{'timestamp': '%s', 'src_ip': '%s', 'payload_printable': '%s'}" %
+                          (datetime.datetime.now().isoformat(),
+                           self.client_address[0],
                            format % args))
         self.hpfl.log('debug', "%s - - [%s] %s" %
                           (self.client_address[0],
@@ -253,9 +254,10 @@ if __name__ == '__main__':
 
         def alert(cls, host, port, payloads):
             logger.critical({
-                'src': host,
-                'spt': port,
-                'data': payloads,
+                 'timestamp': datetime.datetime.utcnow().isoformat(),
+                 'src_ip': host,
+                 'src_port': port,
+                 'payload_printable': payloads,
             })
             #log to hpfeeds
             hpfl.log("critical", {
@@ -274,10 +276,8 @@ if __name__ == '__main__':
 
         def log_date_time_string():
             """Return the current time formatted for logging."""
-            now = time.time()
-            year, month, day, hh, mm, ss, x, y, z = time.localtime(now)
-            s = "%02d/%3s/%04d %02d:%02d:%02d" % (day, requestHandler.monthname[month], year, hh, mm, ss)
-            return s
+            now = datetime.datetime.now().isoformat()
+            return now
 
         def ike():
             ike_server.start(host, ike_port, alert, logger, hpfl)
