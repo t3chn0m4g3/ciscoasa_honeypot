@@ -10,7 +10,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 
 
 def gencert():
-    filename = os.path.dirname(os.path.abspath(__file__)) + '/tempcert.pem'
+    filename = os.path.dirname(os.path.abspath(__file__)) + '/tmp/tempcert.pem'
     certfile = open(filename, 'wb')
 
     # Generate our key
