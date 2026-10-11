@@ -3,6 +3,7 @@ package ike
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"github.com/t3chn0m4g3/ciscoasa_honeypot/internal/identity"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -133,6 +135,22 @@ func (s *Server) Handle(raw []byte, peer string, port int) []byte {
 	}
 	key := peer + "/" + strconv.Itoa(port) + "/" + hex.EncodeToString(p.Initiator[:])
 	st := s.sessions[key]
+	// NAT-T may change both UDP ports after SA_INIT. Only an authenticated
+	// encrypted IKE_AUTH can move an existing SA to its new endpoint.
+	if st == nil && major == 2 && p.Exchange == 35 && p.Flags&8 != 0 && p.Flags&0x20 == 0 && p.Responder != ([8]byte{}) {
+		suffix := "/" + hex.EncodeToString(p.Initiator[:])
+		for oldKey, candidate := range s.sessions {
+			candidateIP, _ := eventlog.Peer(candidate.Peer)
+			if candidateIP == ip && strings.HasSuffix(oldKey, suffix) && candidate.Responder == p.Responder && candidate.Keys != nil && candidate.Keys.validAuth(raw, p) {
+				st = candidate
+				delete(s.sessions, oldKey)
+				s.sessions[key] = st
+				st.Peer = peer
+				break
+			}
+		}
+	}
+
 	if major == 2 && (p.Flags&0x20 != 0 || p.Flags&8 == 0) {
 		return nil
 	}
@@ -225,6 +243,20 @@ func (s *Server) Handle(raw []byte, peer string, port int) []byte {
 		}
 		if e.Type != "ike.aggressive" {
 			e.Type = "ike.proposal"
+		}
+		if major == 2 {
+			requestedNAT := false
+			for _, x := range p.Payloads {
+				if x.Type == 41 && len(x.Data) >= 4 {
+					code := binary.BigEndian.Uint16(x.Data[2:])
+					if code == 16388 || code == 16389 {
+						requestedNAT = true
+					}
+				}
+			}
+			if requestedNAT {
+				parts = append(parts, natDetection(p, localIP(net.ParseIP(ip)), port, 16388), natDetection(p, net.ParseIP(ip), src, 16389))
+			}
 		}
 		parts = append(parts, s.vendors(p.Version, natt)...)
 		response := Encode(p, parts)
@@ -338,4 +370,45 @@ func (s *Server) retransmit(c *net.UDPConn, natt bool, port int) {
 		v.Retries++
 		v.Next = now.Add(8 * time.Second)
 	}
+}
+
+// Find a local address on the peer subnet without any network connection.
+func localIP(peer net.IP) net.IP {
+	addresses, err := net.InterfaceAddrs()
+	if err != nil {
+		return net.IPv4zero
+	}
+	var fallback net.IP
+	for _, address := range addresses {
+		network, ok := address.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		ip := network.IP
+		if (peer.To4() != nil) != (ip.To4() != nil) {
+			continue
+		}
+		if network.Contains(peer) {
+			return ip
+		}
+		if fallback == nil && ip.IsGlobalUnicast() && !ip.IsLoopback() {
+			fallback = ip
+		}
+	}
+	if fallback != nil {
+		return fallback
+	}
+	return net.IPv4zero
+}
+func natDetection(p Packet, ip net.IP, port int, code uint16) Payload {
+	data := append(append([]byte{}, p.Initiator[:]...), p.Responder[:]...)
+	if v4 := ip.To4(); v4 != nil {
+		ip = v4
+	}
+	data = append(data, ip...)
+	data = append(data, byte(port>>8), byte(port))
+	digest := sha1.Sum(data)
+	b := []byte{0, 0, byte(code >> 8), byte(code)}
+	b = append(b, digest[:]...)
+	return Payload{Type: 41, Data: b}
 }

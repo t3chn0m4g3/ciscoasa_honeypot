@@ -72,11 +72,14 @@ func TestV2EncryptedAuthFailure(t *testing.T) {
 	p.Initiator[0] = 3
 	peer := make([]byte, 256)
 	peer[255] = 2
-	b := Encode(p, []Payload{{Type: 33, Data: v2SA()}, {Type: 34, Data: append([]byte{0, 14, 0, 0}, peer...)}, {Type: 40, Data: random(32)}})
+	b := Encode(p, []Payload{{Type: 33, Data: v2SA()}, {Type: 34, Data: append([]byte{0, 14, 0, 0}, peer...)}, {Type: 40, Data: random(32)}, natDetection(p, net.IPv4(192, 0, 2, 1), 12345, 16388)})
 	resp := s.Handle(b, "192.0.2.1:12345", 500)
 	rp, e := Parse(resp)
 	if e != nil {
 		t.Fatal(e)
+	}
+	if notify := Find(rp, 41); len(notify) != 24 || binary.BigEndian.Uint16(notify[2:]) != 16388 {
+		t.Fatal("NAT detection missing", notify)
 	}
 	if Find(rp, 34) == nil {
 		t.Fatal(rp)
@@ -105,6 +108,15 @@ func TestV2EncryptedAuthFailure(t *testing.T) {
 	}
 	if !bytes.Equal(resp, s.Handle(b, "192.0.2.1:12345", 500)) {
 		t.Fatal("IKE_AUTH retransmission changed")
+	}
+	invalid := append([]byte{}, b...)
+	invalid[len(invalid)-1] ^= 1
+	if s.Handle(invalid, "192.0.2.1:55555", 4500) != nil {
+		t.Fatal("unauthenticated NAT-T migration accepted")
+	}
+	// Move the same authenticated SA to NAT-T and a different source port.
+	if !bytes.Equal(resp, s.Handle(b, "192.0.2.1:54321", 4500)) {
+		t.Fatal("NAT-T port floating lost the SA")
 	}
 	data := Find(rp, 46)
 	block, _ = aes.NewCipher(k.er)
@@ -171,5 +183,19 @@ func TestCiscoVendorOrdering(t *testing.T) {
 		if !bytes.Equal(x.Data, vid(want[i])) {
 			t.Fatal(i, x.Data)
 		}
+	}
+}
+
+func TestNATDetectionHashes(t *testing.T) {
+	p := Packet{Version: 0x20}
+	p.Initiator[0] = 1
+	p.Responder[0] = 2
+	x := natDetection(p, net.IPv4(192, 0, 2, 1), 500, 16388)
+	if x.Type != 41 || len(x.Data) != 24 || binary.BigEndian.Uint16(x.Data[2:]) != 16388 {
+		t.Fatal(x)
+	}
+	y := natDetection(p, net.IPv4(192, 0, 2, 1), 4500, 16388)
+	if bytes.Equal(x.Data, y.Data) {
+		t.Fatal("NAT detection ignored port")
 	}
 }
