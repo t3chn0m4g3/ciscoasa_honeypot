@@ -280,6 +280,8 @@ func events(t *testing.T, s *Server) []eventlog.Event {
 
 func TestPacketBudgetAndSummary(t *testing.T) {
 	s := testServer(t)
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	s.now = func() time.Time { return now }
 	answered := 0
 	for i := 0; i < 25; i++ {
 		p := Packet{Version: 0x10, Exchange: 2}
@@ -294,7 +296,7 @@ func TestPacketBudgetAndSummary(t *testing.T) {
 	s.mu.Lock()
 	s.cleaned = time.Time{}
 	s.mu.Unlock()
-	s.maintainAt(time.Now().Add(time.Minute))
+	s.maintainAt(now.Add(time.Minute))
 	got := events(t, s)
 	if len(got) != 25 {
 		t.Fatal(len(got))
@@ -315,6 +317,8 @@ func TestPacketBudgetAndSummary(t *testing.T) {
 
 func TestSourceNetworkBudget(t *testing.T) {
 	s := testServer(t)
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	s.now = func() time.Time { return now }
 	answered := 0
 	for i := 0; i < 15; i++ {
 		p := Packet{Version: 0x10, Exchange: 2}
@@ -422,5 +426,26 @@ func TestSessionRequestHashesAndCapacity(t *testing.T) {
 	}
 	if len(s.sessions) != 4096 {
 		t.Fatal(len(s.sessions))
+	}
+}
+
+func TestPacketWindowAdvance(t *testing.T) {
+	s := testServer(t)
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	s.now = func() time.Time { return now }
+	p := Packet{Version: 0x10, Exchange: 2}
+	p.Initiator[0] = 1
+	request := Encode(p, []Payload{{Type: 1, Data: v1SA()}})
+	for i := 0; i < sourceRate; i++ {
+		if s.Handle(request, "192.0.2.1:500", 500) == nil {
+			t.Fatal(i)
+		}
+	}
+	if s.Handle(request, "192.0.2.1:500", 500) != nil {
+		t.Fatal("current window")
+	}
+	now = now.Add(time.Second)
+	if s.Handle(request, "192.0.2.1:500", 500) == nil {
+		t.Fatal("next window")
 	}
 }
