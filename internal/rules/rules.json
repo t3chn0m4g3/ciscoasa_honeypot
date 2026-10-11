@@ -1,0 +1,12 @@
+[
+ {"cve":"CVE-2018-0101","body":["host-scan-reply"]},
+ {"cve":"CVE-2018-0296","path":["/+CSCOE+/","../"]},
+ {"cve":"CVE-2020-3452","path":["/+CSCOT+/translation-table"],"uri":["textdomain"]},
+ {"cve":"CVE-2020-3452","path":["/+CSCOT+/oem-customization"],"uri":["../"]},
+ {"cve":"CVE-2020-3580","method":"POST","path":["/+CSCOE+/"],"body":["<script"]},
+ {"cve":"CVE-2020-3581","method":"POST","path":["/+CSCOE+/"],"body":["onerror="]},
+ {"cve":"CVE-2020-3187","path":["/+CSCOE+/session_password.html"],"uri":["../"]},
+ {"cve":"CVE-2025-20362","path":["/+CSCOU+/","../","+CSCOE+"]},
+ {"cve":"CVE-2025-20333","method":"POST","path":["CSCOEfilesfileaction.html"],"boundary_gt":8192},
+ {"cve":"CVE-2025-20333","method":"POST","path":["/+CSCOE+/files/file_action.html"],"boundary_gt":8192}
+]
