@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -11,7 +12,6 @@ import (
 	"github.com/t3chn0m4g3/ciscoasa_honeypot/internal/identity"
 	"net"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 )
@@ -19,31 +19,48 @@ import (
 type session struct {
 	Peer           string
 	Last           time.Time
-	Next           time.Time
-	Retries        int
 	Response       []byte
-	Request        []byte
-	LatestRequest  []byte
+	Request        [32]byte
+	LatestRequest  [32]byte
 	LatestResponse []byte
 	Responder      [8]byte
 	Group          uint16
 	Keys           *keys
-	Done           bool
+}
+
+const globalRate = 20
+const sourceRate = 10
+const payloadLog = 1024
+const globalBytes = 64 << 10
+const sourceBytes = 8 << 10
+
+type endpoint struct {
+	IP        string
+	Initiator [8]byte
+	Responder [8]byte
 }
 type Server struct {
-	Profile  *identity.Profile
-	Log      *eventlog.Writer
-	mu       sync.Mutex
-	sessions map[string]*session
-	rates    map[string]rate
+	Profile   *identity.Profile
+	Log       *eventlog.Writer
+	mu        sync.Mutex
+	sessions  map[string]*session
+	rates     map[string]rate
+	networks  map[string]rate
+	global    rate
+	output    rate
+	indexed   map[endpoint]string
+	summaries *eventlog.Summary
+	cleaned   time.Time
+	now       func() time.Time
 }
 type rate struct {
 	Start time.Time
 	Count int
+	Bytes int
 }
 
 func New(p *identity.Profile, l *eventlog.Writer) *Server {
-	return &Server{Profile: p, Log: l, sessions: map[string]*session{}, rates: map[string]rate{}}
+	return &Server{Profile: p, Log: l, sessions: map[string]*session{}, rates: map[string]rate{}, networks: map[string]rate{}, indexed: map[endpoint]string{}, summaries: eventlog.NewSummary(l), now: time.Now}
 }
 func (s *Server) vendors(version byte, natt bool) []Payload {
 	typ := byte(13)
@@ -75,41 +92,38 @@ func notify(p Packet, code uint16, extra []byte) []byte {
 	return Encode(p, []Payload{{Type: 11, Data: b}})
 }
 func (s *Server) Handle(raw []byte, peer string, port int) []byte {
+	return s.handle(raw, peer, port, port == 4500)
+}
+func (s *Server) handle(raw []byte, peer string, port int, marker bool) (response []byte) {
 	ip, src := eventlog.Peer(peer)
-	e := eventlog.Event{Type: "ike.packet", SrcIP: ip, SrcPort: src, DestPort: port, Protocol: "udp", Payload: eventlog.Printable(raw), ASA: eventlog.ASA{Profile: eventlog.Profile{Version: s.Profile.Version, Hostname: s.Profile.Hostname}}}
-	defer func() { eventlog.Report(s.Log, e) }()
+	now := s.now()
+	s.maintainAt(now)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	now := time.Now()
-	for k, v := range s.sessions {
-		if now.Sub(v.Last) > time.Minute {
-			delete(s.sessions, k)
-		}
+	now = s.now()
+	reject := func() {
+		s.summaries.Add(eventlog.Event{Type: "ike.ratelimit", SrcIP: ip, DestPort: port, Protocol: "udp", ASA: eventlog.ASA{Profile: eventlog.Profile{Version: s.Profile.Version, Hostname: s.Profile.Hostname}}}, now)
 	}
-	for k, v := range s.rates {
-		if now.Sub(v.Start) > time.Second {
-			delete(s.rates, k)
-		}
-	}
-	rate := s.rates[ip]
-	if now.Sub(rate.Start) > time.Second {
-		rate.Start = now
-		rate.Count = 0
-	}
-	rate.Count++
-	if len(s.rates) >= 4096 && rate.Count == 1 {
-		return nil
-	}
-	s.rates[ip] = rate
-	if rate.Count > 20 {
+	network := sourceNetwork(ip)
+	if !s.admit(ip, network, now) {
+		reject()
 		return nil
 	}
 	p, err := Parse(raw)
 	if err != nil {
-		e.Type = "error"
-		e.ASA.Error = err.Error()
+		reject()
 		return nil
 	}
+	e := eventlog.Event{Type: "ike.packet", SrcIP: ip, SrcPort: src, DestPort: port, Protocol: "udp", Payload: eventlog.Bound(eventlog.Printable(raw[:min(len(raw), payloadLog)]), payloadLog), ASA: eventlog.ASA{Profile: eventlog.Profile{Version: s.Profile.Version, Hostname: s.Profile.Hostname}}}
+	defer func() {
+		if len(response) > 0 && !s.charge(network, ip, len(raw), len(response), marker, now) {
+			response = nil
+			reject()
+			return
+		}
+		eventlog.Report(s.Log, e)
+	}()
+	digest := sha256.Sum256(raw)
 	major := p.Version >> 4
 	e.ASA.IKE = &eventlog.IKE{Version: strconv.Itoa(int(major)), Exchange: strconv.Itoa(int(p.Exchange)), Proposals: proposalSummary(p)}
 	natt := false
@@ -138,16 +152,14 @@ func (s *Server) Handle(raw []byte, peer string, port int) []byte {
 	// NAT-T may change both UDP ports after SA_INIT. Only an authenticated
 	// encrypted IKE_AUTH can move an existing SA to its new endpoint.
 	if st == nil && major == 2 && p.Exchange == 35 && p.Flags&8 != 0 && p.Flags&0x20 == 0 && p.Responder != ([8]byte{}) {
-		suffix := "/" + hex.EncodeToString(p.Initiator[:])
-		for oldKey, candidate := range s.sessions {
-			candidateIP, _ := eventlog.Peer(candidate.Peer)
-			if candidateIP == ip && strings.HasSuffix(oldKey, suffix) && candidate.Responder == p.Responder && candidate.Keys != nil && candidate.Keys.validAuth(raw, p) {
-				st = candidate
-				delete(s.sessions, oldKey)
-				s.sessions[key] = st
-				st.Peer = peer
-				break
-			}
+		oldKey := s.indexed[endpoint{ip, p.Initiator, p.Responder}]
+		candidate := s.sessions[oldKey]
+		if candidate != nil && candidate.Keys != nil && candidate.Keys.validAuth(raw, p) {
+			st = candidate
+			delete(s.sessions, oldKey)
+			s.sessions[key] = st
+			s.indexed[endpoint{ip, p.Initiator, p.Responder}] = key
+			st.Peer = peer
 		}
 	}
 
@@ -159,7 +171,7 @@ func (s *Server) Handle(raw []byte, peer string, port int) []byte {
 			return nil
 		}
 		st.Last = now
-		if bytes.Equal(raw, st.LatestRequest) {
+		if digest == st.LatestRequest {
 			return append([]byte{}, st.LatestResponse...)
 		}
 		p.Responder = st.Responder
@@ -167,23 +179,16 @@ func (s *Server) Handle(raw []byte, peer string, port int) []byte {
 	initial := major == 2 && p.Exchange == 34 && p.MessageID == 0 || major == 1 && (p.Exchange == 2 || p.Exchange == 4) && Find(p, 1) != nil
 	if initial {
 		if st != nil {
-			if !bytes.Equal(raw, st.Request) {
+			if digest != st.Request {
 				return nil
 			}
 			return append([]byte{}, st.Response...)
 		}
 		if len(s.sessions) >= 4096 {
-			oldest := ""
-			var when time.Time
-			for k, v := range s.sessions {
-				if oldest == "" || v.Last.Before(when) {
-					oldest = k
-					when = v.Last
-				}
-			}
-			delete(s.sessions, oldest)
+			reject()
+			return nil
 		}
-		st = &session{Peer: peer, Last: now, Next: now.Add(8 * time.Second)}
+		st = &session{Peer: peer, Last: now}
 		copy(st.Responder[:], random(8))
 		p.Responder = st.Responder
 		parts := []Payload{}
@@ -238,7 +243,7 @@ func (s *Server) Handle(raw []byte, peer string, port int) []byte {
 				}
 				parts = append(parts, Payload{Type: 4, Data: pub}, Payload{Type: 10, Data: random(32)}, Payload{Type: 5, Data: append([]byte{2, 0, 0, 0}, []byte(s.Profile.Hostname+"."+s.Profile.Domain)...)}, Payload{Type: 8, Data: random(hashLen)})
 				e.Type = "ike.aggressive"
-				e.ASA.IKE.GroupName = eventlog.Printable(id[4:])
+				e.ASA.IKE.GroupName = eventlog.Bound(string(id[4:]), 256)
 			}
 		}
 		if e.Type != "ike.aggressive" {
@@ -255,14 +260,15 @@ func (s *Server) Handle(raw []byte, peer string, port int) []byte {
 				}
 			}
 			if requestedNAT {
-				parts = append(parts, natDetection(p, localIP(net.ParseIP(ip)), port, 16388), natDetection(p, net.ParseIP(ip), src, 16389))
+				parts = append(parts, natDetection(p, s.natAddress(net.ParseIP(ip)), port, 16388), natDetection(p, net.ParseIP(ip), src, 16389))
 			}
 		}
 		parts = append(parts, s.vendors(p.Version, natt)...)
 		response := Encode(p, parts)
 		st.Response = response
-		st.Request = append([]byte{}, raw...)
+		st.Request = digest
 		s.sessions[key] = st
+		s.indexed[endpoint{ip, p.Initiator, st.Responder}] = key
 		return append([]byte{}, response...)
 	}
 	if st == nil {
@@ -274,9 +280,8 @@ func (s *Server) Handle(raw []byte, peer string, port int) []byte {
 			e.ASA.Error = "invalid encrypted IKE_AUTH"
 			return nil
 		}
-		st.Done = true
 		response := st.Keys.reject(p)
-		st.LatestRequest = append([]byte{}, raw...)
+		st.LatestRequest = digest
 		st.LatestResponse = append([]byte{}, response...)
 		return response
 	}
@@ -288,14 +293,12 @@ func (s *Server) Handle(raw []byte, peer string, port int) []byte {
 		if len(Find(p, 10)) < 8 {
 			return nil
 		}
-		st.Done = true
 		response := Encode(p, []Payload{{Type: 4, Data: pub}, {Type: 10, Data: random(32)}})
-		st.LatestRequest = append([]byte{}, raw...)
+		st.LatestRequest = digest
 		st.LatestResponse = append([]byte{}, response...)
 		return response
 	}
 	if major == 1 {
-		st.Done = true
 		return notify(p, 24, nil)
 	}
 	return nil
@@ -314,6 +317,7 @@ func (s *Server) Serve(ctx context.Context, c *net.UDPConn, natt bool) error {
 	buf := make([]byte, MaxPacket+1)
 	_, port := eventlog.Peer(c.LocalAddr().String())
 	for {
+		s.maintain()
 		c.SetReadDeadline(time.Now().Add(time.Second))
 		n, peer, err := c.ReadFromUDP(buf)
 		if err != nil {
@@ -321,7 +325,7 @@ func (s *Server) Serve(ctx context.Context, c *net.UDPConn, natt bool) error {
 				return nil
 			}
 			if e, ok := err.(net.Error); ok && e.Timeout() {
-				s.retransmit(c, natt, port)
+				s.maintain()
 				continue
 			}
 			return err
@@ -336,69 +340,113 @@ func (s *Server) Serve(ctx context.Context, c *net.UDPConn, natt bool) error {
 			}
 			b = b[4:]
 		}
-		response := s.Handle(b, peer.String(), port)
+		response := s.handle(b, peer.String(), port, natt)
 		if len(response) > 0 {
 			if natt {
 				response = append([]byte{0, 0, 0, 0}, response...)
 			}
 			c.WriteToUDP(response, peer)
 		}
-		s.retransmit(c, natt, port)
+		s.maintain()
 	}
 }
-func (s *Server) retransmit(c *net.UDPConn, natt bool, port int) {
+func sourceNetwork(ip string) string {
+	address := net.ParseIP(ip)
+	if v4 := address.To4(); v4 != nil {
+		return v4.Mask(net.CIDRMask(24, 32)).String() + "/24"
+	}
+	if address != nil {
+		return address.Mask(net.CIDRMask(64, 128)).String() + "/64"
+	}
+	return "unknown"
+}
+func window(r rate, now time.Time) rate {
+	start := now.Truncate(time.Second)
+	if !r.Start.Equal(start) {
+		return rate{Start: start}
+	}
+	return r
+}
+func (s *Server) admit(ip, network string, now time.Time) bool {
+	s.global = window(s.global, now)
+	s.output = window(s.output, now)
+	r := window(s.rates[ip], now)
+	n := window(s.networks[network], now)
+	if s.global.Count >= globalRate || r.Count >= 20 || n.Count >= sourceRate || s.output.Bytes > globalBytes-2048 || n.Bytes > sourceBytes-2048 {
+		return false
+	}
+	if _, ok := s.rates[ip]; !ok && len(s.rates) >= 4096 {
+		return false
+	}
+	if _, ok := s.networks[network]; !ok && len(s.networks) >= 4096 {
+		return false
+	}
+	s.global.Count++
+	r.Count++
+	n.Count++
+	s.rates[ip] = r
+	s.networks[network] = n
+	return true
+}
+func (s *Server) charge(network, ip string, request, response int, marker bool, now time.Time) bool {
+	overhead := 28
+	if net.ParseIP(ip).To4() == nil {
+		overhead = 48
+	}
+	if marker {
+		overhead += 4
+	}
+	size := response + overhead
+	n := window(s.networks[network], now)
+	s.output = window(s.output, now)
+	if size > 3*(request+overhead) || s.output.Bytes+size > globalBytes || n.Bytes+size > sourceBytes {
+		return false
+	}
+	s.output.Bytes += size
+	n.Bytes += size
+	s.networks[network] = n
+	return true
+}
+func (s *Server) maintain() { s.maintainAt(s.now()) }
+func (s *Server) maintainAt(now time.Time) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := time.Now()
-	for key, v := range s.sessions {
+	if now.Sub(s.cleaned) < time.Second {
+		s.mu.Unlock()
+		return
+	}
+	s.cleaned = now
+	for k, v := range s.sessions {
 		if now.Sub(v.Last) > time.Minute {
-			delete(s.sessions, key)
-			continue
+			ip, _ := eventlog.Peer(v.Peer)
+			var spi [8]byte
+			if len(v.Response) >= 8 {
+				copy(spi[:], v.Response[:8])
+			}
+			delete(s.indexed, endpoint{ip, spi, v.Responder})
+			delete(s.sessions, k)
 		}
-		if v.Done || v.Retries >= 3 || now.Before(v.Next) || !bytes.Contains([]byte(key), []byte("/"+strconv.Itoa(port)+"/")) {
-			continue
-		}
-		peer, err := net.ResolveUDPAddr("udp", v.Peer)
-		if err != nil {
-			continue
-		}
-		b := v.Response
-		if natt {
-			b = append([]byte{0, 0, 0, 0}, b...)
-		}
-		c.WriteToUDP(b, peer)
-		v.Retries++
-		v.Next = now.Add(8 * time.Second)
 	}
+	for k, v := range s.rates {
+		if now.Sub(v.Start) > time.Second {
+			delete(s.rates, k)
+		}
+	}
+	for k, v := range s.networks {
+		if now.Sub(v.Start) > time.Second {
+			delete(s.networks, k)
+		}
+	}
+	s.mu.Unlock()
+	s.summaries.Tick(now)
 }
-
-// Find a local address on the peer subnet without any network connection.
-func localIP(peer net.IP) net.IP {
-	addresses, err := net.InterfaceAddrs()
-	if err != nil {
-		return net.IPv4zero
+func (s *Server) natAddress(peer net.IP) net.IP {
+	h := sha256.Sum256([]byte(s.Profile.ConfigHash + "/" + s.Profile.Hostname + "/" + s.Profile.Domain))
+	if peer.To4() != nil {
+		return net.IPv4(10, h[0], h[1], 1+h[2]%254)
 	}
-	var fallback net.IP
-	for _, address := range addresses {
-		network, ok := address.(*net.IPNet)
-		if !ok {
-			continue
-		}
-		ip := network.IP
-		if (peer.To4() != nil) != (ip.To4() != nil) {
-			continue
-		}
-		if network.Contains(peer) {
-			return ip
-		}
-		if fallback == nil && ip.IsGlobalUnicast() && !ip.IsLoopback() {
-			fallback = ip
-		}
-	}
-	if fallback != nil {
-		return fallback
-	}
-	return net.IPv4zero
+	b := append(net.IP(nil), h[:16]...)
+	b[0] = 0xfd
+	return b
 }
 func natDetection(p Packet, ip net.IP, port int, code uint16) Payload {
 	data := append(append([]byte{}, p.Initiator[:]...), p.Responder[:]...)

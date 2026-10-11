@@ -2,9 +2,11 @@ package webvpn
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"embed"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"github.com/t3chn0m4g3/ciscoasa_honeypot/internal/anyconnect"
 	"github.com/t3chn0m4g3/ciscoasa_honeypot/internal/asdm"
@@ -34,16 +36,55 @@ type attempts struct {
 	Last  time.Time
 }
 type Server struct {
-	Profile *identity.Profile
-	Log     *eventlog.Writer
-	Store   *chain.Store
-	mu      sync.Mutex
-	sprays  map[string]attempts
-	workers chan struct{}
+	Profile        *identity.Profile
+	Log            *eventlog.Writer
+	Store          *chain.Store
+	mu             sync.Mutex
+	sprays         map[string]attempts
+	workers        chan struct{}
+	active         map[string]int
+	total          int
+	summaries      *eventlog.Summary
+	transportStart time.Time
+	transportCount int
 }
 
 func New(p *identity.Profile, l *eventlog.Writer, s *chain.Store) *Server {
-	return &Server{Profile: p, Log: l, Store: s, sprays: map[string]attempts{}, workers: make(chan struct{}, 32)}
+	return &Server{Profile: p, Log: l, Store: s, sprays: map[string]attempts{}, workers: make(chan struct{}, 64), active: map[string]int{}, summaries: eventlog.NewSummary(l)}
+}
+func (s *Server) Maintain(ctx context.Context) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case now := <-ticker.C:
+			s.summaries.Tick(now)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+func (s *Server) enter(ip string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.total >= 64 || s.active[ip] >= 4 {
+		return false
+	}
+	s.total++
+	s.active[ip]++
+	return true
+}
+func (s *Server) leave(ip string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.total--
+	s.active[ip]--
+	if s.active[ip] == 0 {
+		delete(s.active, ip)
+	}
+}
+func (s *Server) limited(ip string, port int) {
+	s.summaries.Add(eventlog.Event{Type: "http.ratelimit", SrcIP: ip, DestPort: port, Protocol: "tcp", ASA: eventlog.ASA{Profile: eventlog.Profile{Version: s.Profile.Version, Hostname: s.Profile.Hostname}}}, time.Now())
 }
 func (s *Server) Handler() http.Handler { return http.HandlerFunc(s.serve) }
 func (s *Server) HTTPServer(addr string) *http.Server {
@@ -87,32 +128,57 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	if a, ok := r.Context().Value(http.LocalAddrContextKey).(interface{ String() string }); ok {
 		_, dest = eventlog.Peer(a.String())
 	}
+	s.summaries.Tick(time.Now())
+	if !s.enter(ip) {
+		s.limited(ip, dest)
+		abort(w)
+	}
+	defer s.leave(ip)
+	report := true
 	e := eventlog.Event{Type: "http.request", SrcIP: ip, SrcPort: port, DestPort: dest, Protocol: "tcp", ASA: eventlog.ASA{Profile: eventlog.Profile{Version: s.Profile.Version, Hostname: s.Profile.Hostname}, HTTP: &eventlog.HTTP{Method: r.Method, URI: r.RequestURI, UserAgent: r.UserAgent()}}}
 	defer func() {
 		if x := recover(); x != nil {
+			if x == http.ErrAbortHandler {
+				panic(x)
+			}
 			e.Type = "error"
 			e.ASA.Error = fmt.Sprintf("handler panic: %v", x)
 			http.Error(w, "Internal Server Error", 500)
 		}
-		eventlog.Report(s.Log, e)
+		if report {
+			eventlog.Report(s.Log, e)
+		}
 	}()
+	headers(w)
+	r.Body = http.MaxBytesReader(w, r.Body, BodyLimit)
+	controller := http.NewResponseController(w)
+	if err := controller.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		report = false
+		s.limited(ip, dest)
+		abort(w)
+	}
+	b, err := io.ReadAll(r.Body)
+	if err == nil {
+		controller.SetReadDeadline(time.Time{})
+	}
+	if err != nil {
+		if _, ok := err.(*http.MaxBytesError); !ok {
+			report = false
+			s.limited(ip, dest)
+			abort(w)
+		}
+		e.Type = "error"
+		e.ASA.Error = "request body size limit"
+		http.Error(w, "Request Entity Too Large", 413)
+		return
+	}
 	select {
 	case s.workers <- struct{}{}:
 		defer func() { <-s.workers }()
 	default:
-		e.Type = "error"
-		e.ASA.Error = "request concurrency limit"
-		http.Error(w, "Service Unavailable", 503)
-		return
-	}
-	headers(w)
-	r.Body = http.MaxBytesReader(w, r.Body, BodyLimit)
-	b, err := io.ReadAll(r.Body)
-	if err != nil {
-		e.Type = "error"
-		e.ASA.Error = err.Error()
-		http.Error(w, "Request Entity Too Large", 413)
-		return
+		report = false
+		s.limited(ip, dest)
+		abort(w)
 	}
 	e.Payload = eventlog.Printable(b)
 	if len(b) == 0 {
@@ -125,13 +191,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	raw := rules.Decode(r.RequestURI)
 	p := r.URL.Path
 	if strings.Contains(strings.ToLower(p), "/+cscoe+/") && strings.Contains(strings.ToLower(string(b)), "host-scan-reply") {
-		e.Type = "anyconnect.hostscan"
-		var parsed any
-		if err := xml.Unmarshal(b, &parsed); err != nil {
-			e.ASA.Anomaly = "malformed host-scan-reply heuristic"
-		}
-		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
-		w.Write([]byte(anyconnect.Failure(s.Profile, true)))
+		s.hostscan(w, b, &e)
 		return
 	}
 	bypass := rules.Has(e.CVE, "CVE-2025-20362")
@@ -144,13 +204,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.Contains(string(b), "host-scan-reply") {
-		e.Type = "anyconnect.hostscan"
-		var parsed any
-		if err := xml.Unmarshal(b, &parsed); err != nil {
-			e.ASA.Anomaly = "malformed host-scan-reply heuristic"
-		}
-		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
-		w.Write([]byte(anyconnect.Failure(s.Profile, true)))
+		s.hostscan(w, b, &e)
 		return
 	}
 	if r.Header.Get("X-Aggregate-Auth") == "1" || strings.Contains(string(b), "config-auth") {
@@ -264,7 +318,6 @@ func (s *Server) logon(w http.ResponseWriter, failed bool) {
 		}
 	}
 	if failed {
-		html = strings.Replace(html, "<body", `<body`, 1)
 		html = strings.Replace(html, "</form>", `<p>Login failed.</p></form>`, 1)
 	}
 	cookie(w, "webvpnlogin", "1")
@@ -333,4 +386,19 @@ func (s *Server) handleChain(w http.ResponseWriter, r *http.Request, b []byte, e
 	} else {
 		w.Write([]byte("Failed to upload file"))
 	}
+}
+
+func (s *Server) hostscan(w http.ResponseWriter, b []byte, e *eventlog.Event) {
+	e.Type = "anyconnect.hostscan"
+	var parsed any
+	if err := xml.Unmarshal(b, &parsed); err != nil {
+		e.ASA.Anomaly = "malformed host-scan-reply heuristic"
+	}
+	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	w.Write([]byte(anyconnect.Failure(s.Profile, true)))
+}
+
+func abort(w http.ResponseWriter) {
+	http.NewResponseController(w).SetReadDeadline(time.Now())
+	panic(http.ErrAbortHandler)
 }
