@@ -2,6 +2,7 @@
 package eventlog
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -50,6 +51,7 @@ type ASA struct {
 	Error      string  `json:"error,omitempty"`
 	Anomaly    string  `json:"anomaly,omitempty"`
 	ChainStage string  `json:"chain_stage,omitempty"`
+	Count      int     `json:"count,omitempty"`
 }
 type Event struct {
 	Timestamp string   `json:"timestamp"`
@@ -65,18 +67,41 @@ type Event struct {
 	ASA       ASA      `json:"asa"`
 }
 
+const FileLimit int64 = 64 << 20
+
 type Writer struct {
-	mu   sync.Mutex
-	path string
+	mu     sync.Mutex
+	path   string
+	file   *os.File
+	info   os.FileInfo
+	closed bool
 }
 
 func New(path string) (*Writer, error) {
-	f, e := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
-	if e != nil {
+	w := &Writer{path: path}
+	if e := w.open(); e != nil {
 		return nil, e
 	}
-	e = f.Close()
-	return &Writer{path: path}, e
+	return w, nil
+}
+
+// open (re)opens the log in append mode and remembers which file it is.
+func (w *Writer) open() error {
+	if w.file != nil {
+		w.file.Close()
+		w.file = nil
+	}
+	f, e := os.OpenFile(w.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if e != nil {
+		return e
+	}
+	info, e := f.Stat()
+	if e != nil {
+		f.Close()
+		return e
+	}
+	w.file, w.info = f, info
+	return nil
 }
 func Bound(s string, n int) string {
 	s = strings.ToValidUTF8(s, "�")
@@ -85,6 +110,24 @@ func Bound(s string, n int) string {
 		s = strings.ToValidUTF8(s, "")
 	}
 	return s
+}
+
+// Clean bounds a single-line string and writes control and other
+// non-printable characters as \xNN or \uNNNN.
+func Clean(s string, n int) string {
+	s = Bound(s, n)
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case unicode.IsPrint(r):
+			b.WriteRune(r)
+		case r < 0x100:
+			fmt.Fprintf(&b, "\\x%02x", r)
+		default:
+			fmt.Fprintf(&b, "\\u%04x", r)
+		}
+	}
+	return Bound(b.String(), n)
 }
 func Printable(b []byte) string {
 	s := Bound(string(b), 4096)
@@ -96,54 +139,120 @@ func Printable(b []byte) string {
 	}, s)
 }
 func (w *Writer) Write(e Event) error {
+	if e.ASA.HTTP != nil {
+		v := *e.ASA.HTTP
+		e.ASA.HTTP = &v
+	}
+	if e.ASA.Client != nil {
+		v := *e.ASA.Client
+		e.ASA.Client = &v
+	}
+	if e.ASA.IKE != nil {
+		v := *e.ASA.IKE
+		v.VendorIDs = append([]string(nil), v.VendorIDs...)
+		v.Proposals = append([]string(nil), v.Proposals...)
+		e.ASA.IKE = &v
+	}
+	e.Type = Clean(e.Type, 64)
+	e.SrcIP = Clean(e.SrcIP, 64)
+	e.Protocol = Clean(e.Protocol, 16)
+	e.ASA.Anomaly = Clean(e.ASA.Anomaly, 1024)
+	e.ASA.ChainStage = Clean(e.ASA.ChainStage, 64)
 	e.Timestamp = time.Now().UTC().Format(time.RFC3339Nano)
-	e.Username = Bound(e.Username, 512)
-	e.Password = Bound(e.Password, 512)
+	e.Username = Clean(e.Username, 512)
+	e.Password = Clean(e.Password, 512)
 	e.Payload = Bound(e.Payload, 4096)
-	e.ASA.Profile.Version = Bound(e.ASA.Profile.Version, 64)
-	e.ASA.Profile.Hostname = Bound(e.ASA.Profile.Hostname, 253)
-	e.ASA.Group = Bound(e.ASA.Group, 256)
-	e.ASA.Error = Bound(e.ASA.Error, 1024)
+	e.ASA.Profile.Version = Clean(e.ASA.Profile.Version, 64)
+	e.ASA.Profile.Hostname = Clean(e.ASA.Profile.Hostname, 253)
+	e.ASA.Group = Clean(e.ASA.Group, 256)
+	e.ASA.Error = Clean(e.ASA.Error, 1024)
+	e.CVE = append([]string(nil), e.CVE...)
+	if len(e.CVE) > 32 {
+		e.CVE = e.CVE[:32]
+	}
+	for i := range e.CVE {
+		e.CVE[i] = Clean(e.CVE[i], 64)
+	}
 	if e.CVE == nil {
 		e.CVE = []string{}
 	}
 	if h := e.ASA.HTTP; h != nil {
-		h.URI = Bound(h.URI, 4096)
-		h.UserAgent = Bound(h.UserAgent, 512)
+		h.Method = Clean(h.Method, 32)
+		h.URI = Clean(h.URI, 4096)
+		h.UserAgent = Clean(h.UserAgent, 512)
 	}
 	if c := e.ASA.Client; c != nil {
-		c.Version = Bound(c.Version, 128)
-		c.Platform = Bound(c.Platform, 128)
-		c.DeviceID = Bound(c.DeviceID, 256)
+		c.Version = Clean(c.Version, 128)
+		c.Platform = Clean(c.Platform, 128)
+		c.DeviceID = Clean(c.DeviceID, 256)
 	}
 	if k := e.ASA.IKE; k != nil {
-		k.GroupName = Bound(k.GroupName, 256)
+		k.GroupName = Clean(k.GroupName, 256)
 		if len(k.VendorIDs) > 32 {
 			k.VendorIDs = k.VendorIDs[:32]
 		}
 		for i := range k.VendorIDs {
-			k.VendorIDs[i] = Bound(k.VendorIDs[i], 128)
+			k.VendorIDs[i] = Clean(k.VendorIDs[i], 128)
 		}
 		if len(k.Proposals) > 32 {
 			k.Proposals = k.Proposals[:32]
 		}
 		for i := range k.Proposals {
-			k.Proposals[i] = Bound(k.Proposals[i], 256)
+			k.Proposals[i] = Clean(k.Proposals[i], 256)
 		}
 	}
-	b, err := json.Marshal(e)
-	if err != nil {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(e); err != nil {
 		return err
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	// Reopen for each event so logrotate rename/create needs no signal in scratch.
-	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if w.closed {
+		return os.ErrClosed
+	}
+	// A renamed or removed log is reopened; copytruncate keeps the same file.
+	if info, err := os.Stat(w.path); w.file == nil || err != nil || !os.SameFile(info, w.info) {
+		if err := w.open(); err != nil {
+			return err
+		}
+	}
+	info, err := w.file.Stat()
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	_, err = f.Write(append(b, '\n'))
+	if info.Size()+int64(buf.Len()) > FileLimit {
+		return nil
+	}
+	if n, err := w.file.Write(buf.Bytes()); err != nil {
+		if n != 0 {
+			return err
+		}
+		if err := w.open(); err != nil {
+			return err
+		}
+		info, statErr := w.file.Stat()
+		if statErr != nil {
+			return statErr
+		}
+		if info.Size()+int64(buf.Len()) > FileLimit {
+			return nil
+		}
+		_, err = w.file.Write(buf.Bytes())
+		return err
+	}
+	return nil
+}
+func (w *Writer) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.closed = true
+	if w.file == nil {
+		return nil
+	}
+	err := w.file.Close()
+	w.file = nil
 	return err
 }
 func Peer(addr string) (string, int) {

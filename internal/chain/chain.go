@@ -2,6 +2,7 @@
 package chain
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -17,6 +18,12 @@ import (
 
 const FileLimit int64 = 2 << 20
 const TotalLimit int64 = 256 << 20
+const StoredFileLimit = 4096
+const StorageUnit int64 = 16 << 10
+
+func storageCost(size int64) int64 {
+	return ((size+StorageUnit-1)/StorageUnit + 1) * StorageUnit
+}
 
 type session struct {
 	IP    string
@@ -24,42 +31,61 @@ type session struct {
 	Last  time.Time
 }
 type Store struct {
-	mu       sync.Mutex
-	dir      string
-	used     int64
-	max      int64
-	sessions map[string]session
+	mu         sync.Mutex
+	dir        string
+	used       int64
+	max        int64
+	charged    int64
+	maxStorage int64
+	files      int
+	maxFiles   int
+	sessions   map[string]session
 }
 
 func New(dir string) (*Store, error) {
 	if e := os.MkdirAll(dir, 0700); e != nil {
 		return nil, e
 	}
-	s := &Store{dir: dir, max: TotalLimit, sessions: map[string]session{}}
-	es, e := os.ReadDir(dir)
-	if e != nil {
-		return nil, e
+
+	s := &Store{dir: dir, max: TotalLimit, maxStorage: TotalLimit, maxFiles: StoredFileLimit, sessions: map[string]session{}}
+	directory, err := os.Open(dir)
+	if err != nil {
+		return nil, err
 	}
-	for _, x := range es {
-		if x.Type().IsRegular() && strings.HasPrefix(x.Name(), ".upload-") {
-			if e := os.Remove(filepath.Join(dir, x.Name())); e != nil {
-				return nil, e
-			}
-			continue
+	defer directory.Close()
+	for {
+		entries, err := directory.ReadDir(128)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return nil, err
 		}
-		if x.Type().IsRegular() && len(x.Name()) == 64 {
-			b, e := hex.DecodeString(x.Name())
-			if e == nil && len(b) == 32 {
-				i, e := x.Info()
-				if e != nil {
-					return nil, e
-				}
-				s.used += i.Size()
+		for _, entry := range entries {
+			if !entry.Type().IsRegular() {
+				continue
 			}
+			info, err := entry.Info()
+			if err != nil {
+				return nil, err
+			}
+			if !info.Mode().IsRegular() {
+				continue
+			}
+			if strings.HasPrefix(entry.Name(), ".upload-") {
+				if err := os.Remove(filepath.Join(dir, entry.Name())); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			s.files++
+			s.used += info.Size()
+			s.charged += storageCost(info.Size())
+		}
+		if errors.Is(err, io.EOF) {
+			break
 		}
 	}
 	return s, nil
 }
+
 func (s *Store) State(token, ip string, bypass bool) (string, string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -100,38 +126,18 @@ func (s *Store) State(token, ip string, bypass bool) (string, string) {
 func (s *Store) Save(r io.Reader) (*eventlog.Upload, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	available := s.max - s.used
-	if available < 0 {
-		available = 0
-	}
-	if available > FileLimit {
-		available = FileLimit
-	}
+
 	h := sha256.New()
-	f, e := os.CreateTemp(s.dir, ".upload-")
-	if e != nil {
-		return nil, e
+	var content bytes.Buffer
+	n, err := io.Copy(io.MultiWriter(h, &content), io.LimitReader(r, FileLimit))
+	if err != nil {
+		return nil, err
 	}
-	defer os.Remove(f.Name())
-	// Keep both temporary and committed bytes inside the disk quota; hash the remainder.
-	n, e := io.Copy(io.MultiWriter(h, f), io.LimitReader(r, available))
-	if e != nil {
-		f.Close()
-		return nil, e
-	}
-	extra, e := io.Copy(h, r)
-	if e != nil {
-		f.Close()
-		return nil, e
+	extra, err := io.Copy(h, r)
+	if err != nil {
+		return nil, err
 	}
 	n += extra
-	if e = f.Sync(); e != nil {
-		f.Close()
-		return nil, e
-	}
-	if e = f.Close(); e != nil {
-		return nil, e
-	}
 	sum := hex.EncodeToString(h.Sum(nil))
 	u := &eventlog.Upload{SHA256: sum, Size: n}
 	if n > FileLimit {
@@ -148,13 +154,31 @@ func (s *Store) Save(r io.Reader) (*eventlog.Upload, error) {
 	} else if !errors.Is(e, os.ErrNotExist) {
 		return nil, e
 	}
-	if n > available || s.used+n > s.max {
+
+	cost := storageCost(n)
+	if s.files >= s.maxFiles || n > s.max-s.used || cost > s.maxStorage-s.charged {
 		return u, nil
 	}
-	if e = os.Rename(f.Name(), path); e != nil {
-		return nil, e
+	f, err := os.CreateTemp(s.dir, ".upload-")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { f.Close(); os.Remove(f.Name()) }()
+	if _, err := io.Copy(f, &content); err != nil {
+		return nil, err
+	}
+	if err := f.Sync(); err != nil {
+		return nil, err
+	}
+	if err := f.Close(); err != nil {
+		return nil, err
+	}
+	if err := os.Rename(f.Name(), path); err != nil {
+		return nil, err
 	}
 	s.used += n
+	s.charged += cost
+	s.files++
 	u.Stored = true
 	u.File = sum
 	return u, nil

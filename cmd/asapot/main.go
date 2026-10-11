@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -38,6 +39,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	defer l.Close()
 	store, err := chain.New(*payloads)
 	if err != nil {
 		return err
@@ -46,7 +48,8 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	server := webvpn.New(p, l, store).HTTPServer(*https)
+	ws := webvpn.New(p, l, store)
+	server := ws.HTTPServer(*https)
 	server.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12, MaxVersion: tls.VersionTLS12, NextProtos: []string{"http/1.1"}, CipherSuites: []uint16{tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384, tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA, tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA}}
 	tcp, err := net.Listen("tcp", *https)
 	if err != nil {
@@ -75,9 +78,12 @@ func run() error {
 	defer stop()
 	errs := make(chan error, 3)
 	is := ike.New(p, l)
-	go func() { errs <- is.Serve(ctx, u, false) }()
-	go func() { errs <- is.Serve(ctx, v, true) }()
-	go func() { errs <- server.ServeTLS(webvpn.Limit(tcp), "", "") }()
+	var workers sync.WaitGroup
+	workers.Add(4)
+	go func() { defer workers.Done(); ws.Maintain(ctx) }()
+	go func() { defer workers.Done(); errs <- is.Serve(ctx, u, false) }()
+	go func() { defer workers.Done(); errs <- is.Serve(ctx, v, true) }()
+	go func() { defer workers.Done(); errs <- server.ServeTLS(webvpn.Limit(tcp), "", "") }()
 	select {
 	case <-ctx.Done():
 	case err = <-errs:
@@ -85,7 +91,11 @@ func run() error {
 	}
 	shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	server.Shutdown(shutdown)
+	stop()
+	if shutdownErr := server.Shutdown(shutdown); shutdownErr != nil {
+		server.Close()
+	}
+	workers.Wait()
 	if err == http.ErrServerClosed {
 		return nil
 	}
