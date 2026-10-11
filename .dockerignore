@@ -1,0 +1,5 @@
+.git
+asa
+*.py
+venv
+**/__pycache__

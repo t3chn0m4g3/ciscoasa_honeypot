@@ -1,8 +1,13 @@
-version: '3'
-
 services:
-  ciscoasa_honeypot:
+  ciscoasa:
     build: .
     ports:
-      - 80:8443
-      - "500:5000/udp"
+      - "8443:8443"
+      - "500:500/udp"
+      - "4500:4500/udp"
+    user: "2000:2000"
+    read_only: true
+    volumes:
+      - ./data/log:/var/log/ciscoasa
+      - ./data/identity:/var/lib/ciscoasa
+      - ./data/payloads:/var/lib/ciscoasa/payloads

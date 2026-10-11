@@ -1,14 +1,13 @@
-FROM python:3-alpine
+FROM --platform=$BUILDPLATFORM golang:1.26.4-alpine3.24 AS builder
+ARG TARGETARCH
+WORKDIR /src
+COPY go.mod ./
+COPY cmd/ cmd/
+COPY internal/ internal/
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/asapot ./cmd/asapot
 
-COPY requirements.txt /usr/src/app/requirements.txt
-WORKDIR /usr/src/app
-ENV BUILD_PKGS="git build-base libffi-dev openssl-dev"
-RUN apk add --no-cache $BUILD_PKGS && \
-    pip install --no-cache -r requirements.txt && \
-    apk del --purge $BUILD_PKGS
-
-COPY . /usr/src/app/
-
-EXPOSE 8443 5000/udp
-
-CMD python asa_server.py --enable_ssl --verbose
+FROM scratch
+COPY --from=builder /out/asapot /asapot
+USER 2000:2000
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/asapot"]
