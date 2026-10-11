@@ -168,3 +168,22 @@ func TestConcurrentBodyBudget(t *testing.T) {
 		t.Fatal("worker permit leaked")
 	}
 }
+
+func TestUnauthenticatedAndPatchedUploadsRemainEvidence(t *testing.T) {
+	s, lp := setup(t)
+	for _, version := range []string{"9.20(4)5", "9.20(4)10"} {
+		s.Profile.Version = version
+		w := request(s, "POST", "/+CSCOE+/files/file_action.html", "inert upload", "application/octet-stream")
+		if w.Code != 403 {
+			t.Fatal(version, w.Code)
+		}
+	}
+	b, _ := os.ReadFile(lp)
+	for _, line := range bytes.Split(bytes.TrimSpace(b), []byte("\n")) {
+		var e eventlog.Event
+		json.Unmarshal(line, &e)
+		if e.Type != "upload" || e.ASA.Upload == nil || !e.ASA.Upload.Stored {
+			t.Fatal(string(line))
+		}
+	}
+}

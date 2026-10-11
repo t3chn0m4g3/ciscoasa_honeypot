@@ -271,18 +271,17 @@ func (s *Server) logon(w http.ResponseWriter, failed bool) {
 	w.Write([]byte(html))
 }
 func (s *Server) handleChain(w http.ResponseWriter, r *http.Request, b []byte, e *eventlog.Event, bypass bool) {
-	if !s.Profile.PreChainFix() {
-		w.WriteHeader(403)
-		w.Write([]byte("Forbidden"))
-		return
-	}
+	vulnerable := s.Profile.PreChainFix()
 	token := ""
 	if c, err := r.Cookie("webvpn"); err == nil {
 		token = c.Value
 	}
-	token, stage := s.Store.State(token, e.SrcIP, bypass)
+	stage := "patched"
+	if vulnerable {
+		token, stage = s.Store.State(token, e.SrcIP, bypass)
+	}
 	e.ASA.ChainStage = stage
-	if token != "" {
+	if vulnerable && token != "" {
 		cookie(w, "webvpn", token)
 	}
 	if r.Method == "POST" && chain.UploadPath(rules.Decode(r.RequestURI)) {
@@ -323,6 +322,15 @@ func (s *Server) handleChain(w http.ResponseWriter, r *http.Request, b []byte, e
 			}
 		}
 	}
+	if !vulnerable || (!bypass && stage == "observed") {
+		w.WriteHeader(403)
+		w.Write([]byte("Forbidden"))
+		return
+	}
 	w.WriteHeader(200)
-	w.Write([]byte(`<script>alert('CSRF token mismatch');</script>Failed to upload file`))
+	if bypass {
+		w.Write([]byte(`<script>alert('CSRF token mismatch');</script>Failed to upload file`))
+	} else {
+		w.Write([]byte("Failed to upload file"))
+	}
 }
