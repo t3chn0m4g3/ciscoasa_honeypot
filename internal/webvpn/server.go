@@ -167,8 +167,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 			s.limited(ip, dest)
 			abort(w)
 		}
-		e.Type = "error"
-		e.ASA.Error = "request body size limit"
+		report = false
+		s.limited(ip, dest)
 		http.Error(w, "Request Entity Too Large", 413)
 		return
 	}

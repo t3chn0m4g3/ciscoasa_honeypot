@@ -360,3 +360,19 @@ func TestConnectionCloseAtRequestCapacity(t *testing.T) {
 		t.Fatal("connection close waited for body")
 	}
 }
+
+func TestBodyLimitSummary(t *testing.T) {
+	s, path := setup(t)
+	if request(s, "POST", "/", strings.Repeat("a", int(BodyLimit)+1), "").Code != 413 {
+		t.Fatal("body size reply")
+	}
+	s.summaries.Tick(time.Now().Add(time.Minute))
+	b, _ := os.ReadFile(path)
+	var got eventlog.Event
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Type != "http.ratelimit" || got.ASA.Count != 1 {
+		t.Fatal(got.Type, got.ASA.Count)
+	}
+}
